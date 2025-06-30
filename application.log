@@ -1,0 +1,2 @@
+2025-06-30 20:50:32,345 - INFO - Processing user request: '‘I‘ð‚·‚é‚±‚Æ'
+2025-06-30 20:50:32,346 - ERROR - Error initializing Gemini model: Invalid constructor input for Tool: <function create_redmine_ticket at 0x000002841EA10680>

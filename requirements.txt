@@ -1,0 +1,6 @@
+google-generativeai
+python-redmine
+python-dotenv
+requests
+pytest
+pytest-mock
