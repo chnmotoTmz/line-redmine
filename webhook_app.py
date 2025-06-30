@@ -11,6 +11,10 @@ from fastapi import FastAPI, Request, HTTPException
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+from datetime import datetime, timezone, timedelta
+import os # osモジュールは既にimportされているかもしれませんが、念のため
 
 # --- 設定の読み込みと検証 ---
 dotenv.load_dotenv()
@@ -33,6 +37,7 @@ app = FastAPI()
 line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
 PRIORITY_IDS = {}
+scheduler = AsyncIOScheduler(timezone="Asia/Tokyo") # タイムゾーンを指定
 
 # --- Redmineツール ---
 def redmine_request(path: str, method: str = 'get', data: dict = None):
@@ -54,6 +59,58 @@ def create_issue(project_id: int, subject: str, description: str, priority_id: i
 
 def list_issue_priorities():
     return redmine_request(path="/enumerations/issue_priorities.json", method="get")
+
+# --- プッシュ通知機能 ---
+async def check_and_notify_overdue_tickets():
+    """
+    Redmineの未完了チケット（期限切れまたは本日期限）をチェックし、LINEでプッシュ通知する。
+    """
+    my_line_user_id = os.environ.get("MY_LINE_USER_ID")
+    if not my_line_user_id:
+        print("ERROR: MY_LINE_USER_ID is not set. Cannot send push notifications.")
+        return
+
+    # タイムゾーンをJSTで取得し、今日の日付を文字列にする
+    jst = timezone(timedelta(hours=9))
+    today_jst_str = datetime.now(jst).strftime('%Y-%m-%d')
+
+    # .envから未完了ステータスのIDを取得
+    open_status_ids = os.environ.get("REDMINE_OPEN_STATUS_IDS")
+    if not open_status_ids:
+        print("WARNING: REDMINE_OPEN_STATUS_IDS is not set. Push notification might not work as expected.")
+        return
+
+    # Redmine APIで "本日以前が期日の未完了チケット" を取得するクエリ
+    path = f"/issues.json?status_id={open_status_ids}&due_date=<={today_jst_str}&sort=due_date:asc"
+    print(f"Fetching overdue tickets with path: {path}")
+    result = redmine_request(path=path, method="get")
+
+    messages_to_send = []
+
+    if result.get("error"):
+        print(f"ERROR: Could not fetch overdue tickets from Redmine. Details: {result.get('error')}")
+    else:
+        issues = result.get("body", {}).get("issues", [])
+        if issues:
+            message = "【Redmine期限通知】\n以下のチケットが期限切れまたは本日期限です。\n\n"
+            for issue in issues:
+                due_date = issue.get('due_date', '期限未設定')
+                # RedmineのAPIはUTCで日付を返すことが多いので、必要に応じてJSTに変換
+                # ここでは簡単のため、そのまま表示
+                message += f"- ID: {issue['id']}, 件名: {issue['subject']}, 期限: {due_date}\n"
+            messages_to_send.append(message)
+        else:
+            print("No overdue or due today tickets found.")
+            # 通知しないか、あるいは「期限切れチケットはありません」と通知するかは要件次第
+            # ここでは何もしない
+
+    if messages_to_send:
+        for msg_text in messages_to_send:
+            try:
+                line_bot_api.push_message(my_line_user_id, TextSendMessage(text=msg_text))
+                print(f"Sent push notification to {my_line_user_id}")
+            except Exception as e:
+                print(f"Failed to send push message to {my_line_user_id}: {e}")
 
 # --- FastAPIアプリケーションロジック ---
 
@@ -95,6 +152,22 @@ async def startup_event():
     
     PRIORITY_IDS = priority_map
     print("\n=== Application startup successful! ===")
+
+    # スケジューラのジョブ追加と開始
+    # 毎日朝8時に実行
+    scheduler.add_job(check_and_notify_overdue_tickets, CronTrigger(hour=8, minute=0, timezone="Asia/Tokyo"))
+    if not scheduler.running:
+         scheduler.start()
+         print("Scheduler started.")
+    else:
+        print("Scheduler already running.")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if scheduler.running:
+        scheduler.shutdown()
+        print("Scheduler stopped.")
 
 async def create_redmine_ticket_from_text(user_text: str, project_id: int = 1) -> str:
     try:
@@ -195,27 +268,75 @@ def create_redmine_ticket(subject: str, description: str, priority_name: str = "
     )
 
     if result.get("error"):
-        return json.dumps({"status": "error", "message": result.get('body', result.get('error'))})
+        return json.dumps({
+            "status": "error", 
+            "message": f"チケット作成に失敗しました: {result.get('body', result.get('error'))}"
+        })
     
     ticket_info = result.get("body", {}).get("issue", {})
     ticket_id = ticket_info.get("id")
-    ticket_url = f"{REDMINE_URL}/issues/{ticket_id}" if ticket_id else ""
+    
+    if not ticket_id:
+        return json.dumps({
+            "status": "error",
+            "message": "チケットは作成されましたが、IDの取得に失敗しました。"
+        })
+    
+    ticket_url = f"{REDMINE_URL}/issues/{ticket_id}"
     
     return json.dumps({
         "status": "success",
+        "message": f"チケットを正常に作成しました！",
         "ticket_id": ticket_id,
-        "url": ticket_url
+        "ticket_url": ticket_url,
+        "subject": subject,
+        "priority": priority_name
     })
 
-def search_redmine_issues(query: str):
+def search_redmine_issues(query: str = None, due_date: str = None, assigned_to_id: str = None):
     """
-    キーワードに基づいてRedmineのチケットを検索します。
+    キーワード、期日、担当者に基づいてRedmineの未完了チケットを検索します。
     Args:
-        query (str): 検索したいキーワード (例: 'バス', 'エアコン')。
+        query (str, optional): 検索したいキーワード。件名に含まれるものを検索します。
+        due_date (str, optional): 期日を指定します。'today' (今日), 'this_week' (今週)などが使えます。
+        assigned_to_id (str, optional): 担当者IDを指定します。'me' (自分)が使えます。
     """
-    print(f"Executing: search_redmine_issues(query='{query}')")
-    # RedmineのAPIでは件名(subject)でのフィルタリングが直接使える
-    path = f"/issues.json?subject=~{query}" 
+    print(f"Executing: search_redmine_issues(query='{query}', due_date='{due_date}', assigned_to_id='{assigned_to_id}')")
+    
+    params = []
+    if query:
+        params.append(f"subject=~{query}")
+    
+    if due_date:
+        # タイムゾーンをJSTで取得
+        jst = timezone(timedelta(hours=9))
+        now_jst = datetime.now(jst)
+
+        if due_date == 'today':
+            today_str = now_jst.strftime('%Y-%m-%d')
+            params.append(f"due_date={today_str}")
+        elif due_date == 'this_week':
+            start_of_week = now_jst - timedelta(days=now_jst.weekday())
+            end_of_week = start_of_week + timedelta(days=6)
+            # Redmineの日付範囲フィルタ '><' を使用
+            params.append(f"due_date=><{start_of_week.strftime('%Y-%m-%d')}|{end_of_week.strftime('%Y-%m-%d')}")
+    
+    if assigned_to_id:
+        if assigned_to_id == 'me':
+            params.append("assigned_to_id=me")
+        else:
+            params.append(f"assigned_to_id={assigned_to_id}")
+
+    if not params:
+        return json.dumps({"status": "error", "message": "検索条件が指定されていません。"})
+
+    # .envに REDMINE_OPEN_STATUS_IDS=1|2|3 のように設定されていることを期待
+    open_status_ids = os.getenv("REDMINE_OPEN_STATUS_IDS")
+    if open_status_ids:
+        params.append(f"status_id={open_status_ids}")
+
+    path = f"/issues.json?{'&'.join(params)}&sort=due_date:asc"
+    print(f"Searching issues with path: {path}")
     result = redmine_request(path=path, method="get")
 
     if result.get("error"):
@@ -223,14 +344,77 @@ def search_redmine_issues(query: str):
 
     issues = result.get("body", {}).get("issues", [])
     if not issues:
-        return json.dumps({"status": "not_found", "message": f"キーワード「{query}」に一致するチケットは見つかりませんでした。"})
+        search_terms_list = [f"キーワード「{query}」" if query else "", f"期日「{due_date}」" if due_date else "", f"担当者「{assigned_to_id}」" if assigned_to_id else ""]
+        search_terms = "、".join(filter(None, search_terms_list))
+        return json.dumps({"status": "not_found", "message": f"{search_terms}に一致する未完了チケットは見つかりませんでした。"})
 
     # 見つかったチケットの情報を要約して返す
     summarized_issues = [
-        {"id": i["id"], "subject": i["subject"], "status": i["status"]["name"]}
+        {"id": i["id"], "subject": i["subject"], "status": i["status"]["name"], "due_date": i.get("due_date", "未設定")}
         for i in issues
     ]
     return json.dumps({"status": "success", "issues": summarized_issues})
+
+def get_ticket_summary(limit: int = 10, priority_order: str = "high_to_low", status_filter: str = "open"):
+    """
+    チケットの要約を優先度順で取得します。
+    Args:
+        limit (int): 取得するチケット数の上限（デフォルト: 10）
+        priority_order (str): 優先度の並び順。'high_to_low'（高→低）または 'low_to_high'（低→高）
+        status_filter (str): ステータスフィルタ。'open'（未完了のみ）、'all'（全て）
+    """
+    print(f"Executing: get_ticket_summary(limit={limit}, priority_order='{priority_order}', status_filter='{status_filter}')")
+    
+    params = []
+    
+    # ステータスフィルタを適用
+    if status_filter == "open":
+        open_status_ids = os.getenv("REDMINE_OPEN_STATUS_IDS")
+        if open_status_ids:
+            params.append(f"status_id={open_status_ids}")
+    
+    # 優先度順でソート（priority.id を使用）
+    sort_order = "desc" if priority_order == "high_to_low" else "asc"
+    params.append(f"sort=priority:desc,created_on:desc")  # 優先度順、次に作成日順
+    
+    # 取得件数の制限
+    params.append(f"limit={limit}")
+    
+    path = f"/issues.json?{'&'.join(params)}"
+    print(f"Fetching ticket summary with path: {path}")
+    result = redmine_request(path=path, method="get")
+
+    if result.get("error"):
+        return json.dumps({"status": "error", "message": f"チケット取得に失敗しました: {result.get('body', result.get('error'))}"})
+
+    issues = result.get("body", {}).get("issues", [])
+    if not issues:
+        return json.dumps({"status": "not_found", "message": "条件に一致するチケットは見つかりませんでした。"})
+
+    # チケット情報を要約して返す
+    summarized_issues = []
+    for issue in issues:
+        ticket_url = f"{REDMINE_URL}/issues/{issue['id']}"
+        priority_name = issue.get("priority", {}).get("name", "未設定")
+        status_name = issue.get("status", {}).get("name", "未設定")
+        due_date = issue.get("due_date", "未設定")
+        
+        summarized_issues.append({
+            "id": issue["id"],
+            "subject": issue["subject"],
+            "priority": priority_name,
+            "status": status_name,
+            "due_date": due_date,
+            "url": ticket_url,
+            "created_on": issue.get("created_on", "")
+        })
+    
+    return json.dumps({
+        "status": "success", 
+        "total_count": len(summarized_issues),
+        "issues": summarized_issues,
+        "filter_info": f"優先度順: {priority_order}, ステータス: {status_filter}, 件数: {limit}"
+    })
 
 # --- 会話処理のメインロジック ---
 
@@ -251,16 +435,29 @@ gemini_tools = [
                     required=["subject", "description"]
                 )
             ),
-            # ★★★ 新しいツールの定義を追加 ★★★
             genai.protos.FunctionDeclaration(
                 name="search_redmine_issues",
-                description="キーワードを使って既存のRedmineチケットを検索する。",
+                description="キーワード、期日、担当者に基づいて既存のRedmineチケットを検索する。複数の条件を組み合わせることも可能。",
                 parameters=genai.protos.Schema(
                     type=genai.protos.Type.OBJECT,
                     properties={
-                        "query": genai.protos.Schema(type=genai.protos.Type.STRING, description="検索キーワード。ユーザーの質問から最も重要と思われる単語を抽出する。")
-                    },
-                    required=["query"]
+                        "query": genai.protos.Schema(type=genai.protos.Type.STRING, description="検索キーワード。件名に含まれる単語。"),
+                        "due_date": genai.protos.Schema(type=genai.protos.Type.STRING, description="期日。'today'（今日）、'this_week'（今週）などを指定できる。"),
+                        "assigned_to_id": genai.protos.Schema(type=genai.protos.Type.STRING, description="担当者。自分自身のチケットを検索する場合は 'me' を指定する。")
+                    }
+                )
+            ),
+            # ★★★ 新しいツール: チケット要約機能 ★★★
+            genai.protos.FunctionDeclaration(
+                name="get_ticket_summary",
+                description="チケットの要約を優先度順で取得する。優先度の高いタスクから確認したい場合や、全体の状況を把握したい場合に使用。",
+                parameters=genai.protos.Schema(
+                    type=genai.protos.Type.OBJECT,
+                    properties={
+                        "limit": genai.protos.Schema(type=genai.protos.Type.INTEGER, description="取得するチケット数の上限（デフォルト: 10）"),
+                        "priority_order": genai.protos.Schema(type=genai.protos.Type.STRING, description="優先度の並び順。'high_to_low'（高→低）または 'low_to_high'（低→高）。デフォルトは 'high_to_low'"),
+                        "status_filter": genai.protos.Schema(type=genai.protos.Type.STRING, description="ステータスフィルタ。'open'（未完了のみ）または 'all'（全て）。デフォルトは 'open'")
+                    }
                 )
             ),
         ]
@@ -275,11 +472,16 @@ async def handle_conversation(user_id: str, user_text: str) -> str:
     
     # システムプロンプトの定義
     system_instruction = (
-        "あなたはRedmineを操作する優秀なアシスタントです。"
-        "ユーザーとの自然な対話を通じて、タスクを処理してください。"
-        "ユーザーからの情報が不十分な場合は、チケットを作成する前に質問して詳細を確認してください。"
-        "例えば、「PCの調子が悪い」と言われたら、「具体的にどのような状況ですか？」と聞き返してください。"
-        "ユーザーがチケット作成を明確に依頼した場合、または必要な情報が揃ったと判断した場合にのみ、create_redmine_ticketツールを使用してください。"
+        "あなたは、ユーザーの意図を積極的に汲み取り、先回りして行動する非常に優秀なRedmineアシスタントです。"
+        "ユーザーの曖昧な依頼からでも、タスクの目的を推測し、チケット作成や検索を自律的に実行してください。"
+        "ユーザーから提供された情報は、それが断片的であっても、まずはチケットとして記録することを優先します。情報の不足を理由に、何度も質問を繰り返さないでください。"
+        "例えば、バスの予約情報が共有されたら、それを「移動の記録」や「リマインダー」として解釈し、適切な件名と説明で `create_redmine_ticket` を実行してください。目的をユーザーに聞き返す必要はありません。"
+        "「〇〇を忘れないように」という依頼も、そのままチケットの件名や説明にして記録してください。"
+        "「任せます」と言われたら、あなたの判断で最適なアクションを実行し、その結果を報告してください。"
+        "「今日のタスク」「〇〇の件はどうなってる？」のような問い合わせには、`search_redmine_issues` ツールを積極的に使用してください。キーワードだけでなく、日付（'today', 'this_week'など）や担当者（'me'）も指定できることを理解し、ユーザーの言葉から適切な引数を判断してください。"
+        "「優先度の高いタスク」「重要なチケット」「チケット一覧」「要約」などの問い合わせには、`get_ticket_summary` ツールを使用してください。優先度順でチケットを表示し、各チケットのURLも含めて報告してください。"
+        "**重要**: チケット作成が成功した場合は、必ずチケットのURLを含めてユーザーに報告してください。「チケットを作成しました！」だけでなく、「チケットID: XXX」「URL: https://...」のように具体的な情報を提供してください。"
+        "ツール実行後は、その結果（例：作成したチケットのURL、検索結果の要約）を、簡潔で分かりやすい言葉でユーザーに伝えてください。"
     )
 
     # ユーザーごとの会話履歴を取得（なければ初期化）
@@ -317,9 +519,11 @@ async def handle_conversation(user_id: str, user_text: str) -> str:
             tool_result = "" # 初期化
             if tool_name == "create_redmine_ticket":
                 tool_result = create_redmine_ticket(**tool_args)
-            # ★★★ 新しいツールの処理を追加 ★★★
             elif tool_name == "search_redmine_issues":
                 tool_result = search_redmine_issues(**tool_args)
+            # ★★★ 新しいツールの処理を追加 ★★★
+            elif tool_name == "get_ticket_summary":
+                tool_result = get_ticket_summary(**tool_args)
             else:
                 tool_result = json.dumps({"status": "error", "message": f"Unknown tool: {tool_name}"})
 
@@ -381,8 +585,9 @@ if __name__ == "__main__":
     try:
         import httpx
         from linebot import LineBotApi
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler # 追加
     except ImportError:
-        print("\n!!! httpx or line-bot-sdk is not installed. Please run: pip install httpx line-bot-sdk python-dotenv !!!\n")
+        print("\n!!! httpx, line-bot-sdk or apscheduler is not installed. Please run: pip install httpx line-bot-sdk python-dotenv apscheduler !!!\n") # メッセージ修正
         sys.exit(1)
         
     # uvicorn.runの第一引数を文字列ではなく、appオブジェクトに修正
