@@ -8,13 +8,17 @@ import os
 import httpx
 import dotenv
 from fastapi import FastAPI, Request, HTTPException
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import MessageEvent, TextMessage, TextSendMessage
+from contextlib import asynccontextmanager
+# LINE Bot SDK v3の正しいインポート
+from linebot.v3.messaging import Configuration, ApiClient, MessagingApi, ReplyMessageRequest, TextMessage as V3TextMessage
+from linebot.v3.webhook import WebhookHandler
+from linebot.v3.exceptions import InvalidSignatureError
+# 正しいインポートパスに修正
+from linebot.v3.webhooks import MessageEvent, TextMessageContent
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from datetime import datetime, timezone, timedelta
-import os # osモジュールは既にimportされているかもしれませんが、念のため
+import traceback  # traceback をインポートに追加
 
 # --- 設定の読み込みと検証 ---
 dotenv.load_dotenv()
@@ -32,12 +36,70 @@ if not all([GOOGLE_API_KEY, REDMINE_URL, REDMINE_API_KEY, LINE_CHANNEL_ACCESS_TO
     print("CRITICAL: Required environment variables are missing")
     sys.exit(1)
 
-# --- グローバル変数の準備 ---
-app = FastAPI()
-line_bot_api = LineBotApi(LINE_CHANNEL_ACCESS_TOKEN)
+# --- LINE Bot v3の設定 ---
+configuration = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_CHANNEL_SECRET)
+
+# --- グローバル変数の準備 ---
 PRIORITY_IDS = {}
 scheduler = AsyncIOScheduler(timezone="Asia/Tokyo") # タイムゾーンを指定
+
+# --- Lifespan Events ---
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    global PRIORITY_IDS
+    print("=== Verifying API connections on startup ===")
+    
+    # 1. Google APIキーの有効性を最終チェック
+    try:
+        genai.configure(api_key=GOOGLE_API_KEY)
+        genai.GenerativeModel("gemini-2.5-flash").generate_content("Hello")
+        print("✓ Google API key is valid.")
+    except Exception as e:
+        print(f"✗ CRITICAL: Google API key is invalid. Error: {e}")
+        sys.exit(1)
+
+    # 2. Redmineから優先度IDを最終チェック
+    print("Fetching Redmine priority IDs directly...", flush=True)
+    result = list_issue_priorities()
+
+    if result.get("error"):
+        print(f"✗ CRITICAL: Failed to fetch priority IDs. Error: {result['error']}")
+        sys.exit(1)
+    
+    priorities = result.get("body", {}).get("issue_priorities", [])
+    if not priorities:
+        print(f"✗ CRITICAL: 'issue_priorities' not found in response: {result}")
+        sys.exit(1)
+
+    priority_map = {p["name"]: p["id"] for p in priorities}
+    print(f"✓ Successfully fetched priority IDs: {priority_map}")
+    
+    # '通常' と '急いで' の存在を確認
+    if "通常" not in priority_map or "急いで" not in priority_map:
+        print("✗ CRITICAL: Could not find '通常' or '急いで' in Redmine priorities.")
+        sys.exit(1)
+    
+    PRIORITY_IDS = priority_map
+    print("\n=== Application startup successful! ===")
+
+    # スケジューラのジョブ追加と開始
+    scheduler.add_job(check_and_notify_overdue_tickets, CronTrigger(hour=8, minute=0, timezone="Asia/Tokyo"))
+    if not scheduler.running:
+         scheduler.start()
+         print("Scheduler started.")
+    else:
+        print("Scheduler already running.")
+    
+    yield
+    
+    # Shutdown
+    if scheduler.running:
+        scheduler.shutdown()
+        print("Scheduler stopped.")
+
+app = FastAPI(lifespan=lifespan)
 
 # --- Redmineツール ---
 def redmine_request(path: str, method: str = 'get', data: dict = None):
@@ -95,79 +157,28 @@ async def check_and_notify_overdue_tickets():
             message = "【Redmine期限通知】\n以下のチケットが期限切れまたは本日期限です。\n\n"
             for issue in issues:
                 due_date = issue.get('due_date', '期限未設定')
-                # RedmineのAPIはUTCで日付を返すことが多いので、必要に応じてJSTに変換
-                # ここでは簡単のため、そのまま表示
                 message += f"- ID: {issue['id']}, 件名: {issue['subject']}, 期限: {due_date}\n"
             messages_to_send.append(message)
         else:
             print("No overdue or due today tickets found.")
-            # 通知しないか、あるいは「期限切れチケットはありません」と通知するかは要件次第
-            # ここでは何もしない
 
     if messages_to_send:
         for msg_text in messages_to_send:
             try:
-                line_bot_api.push_message(my_line_user_id, TextSendMessage(text=msg_text))
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    # v3の正しいプッシュメッセージ送信方法
+                    line_bot_api.push_message(
+                        PushMessageRequest(
+                            to=my_line_user_id,
+                            messages=[V3TextMessage(text=msg_text)]
+                        )
+                    )
                 print(f"Sent push notification to {my_line_user_id}")
             except Exception as e:
                 print(f"Failed to send push message to {my_line_user_id}: {e}")
 
 # --- FastAPIアプリケーションロジック ---
-
-@app.on_event("startup")
-async def startup_event():
-    global PRIORITY_IDS
-    print("=== Verifying API connections on startup ===")
-    
-    # 1. Google APIキーの有効性を最終チェック
-    try:
-        # モデルを gemini-1.5-flash に変更
-        genai.configure(api_key=GOOGLE_API_KEY)
-        genai.GenerativeModel("gemini-1.5-flash").generate_content("Hello")
-        print("✓ Google API key is valid.")
-    except Exception as e:
-        print(f"✗ CRITICAL: Google API key is invalid. Error: {e}")
-        sys.exit(1)
-
-    # 2. Redmineから優先度IDを最終チェック
-    print("Fetching Redmine priority IDs directly...", flush=True)
-    result = list_issue_priorities()
-
-    if result.get("error"):
-        print(f"✗ CRITICAL: Failed to fetch priority IDs. Error: {result['error']}")
-        sys.exit(1)
-    
-    priorities = result.get("body", {}).get("issue_priorities", [])
-    if not priorities:
-        print(f"✗ CRITICAL: 'issue_priorities' not found in response: {result}")
-        sys.exit(1)
-
-    priority_map = {p["name"]: p["id"] for p in priorities}
-    print(f"✓ Successfully fetched priority IDs: {priority_map}")
-    
-    # '通常' と '急いで' の存在を確認
-    if "通常" not in priority_map or "急いで" not in priority_map:
-        print("✗ CRITICAL: Could not find '通常' or '急いで' in Redmine priorities.")
-        sys.exit(1)
-    
-    PRIORITY_IDS = priority_map
-    print("\n=== Application startup successful! ===")
-
-    # スケジューラのジョブ追加と開始
-    # 毎日朝8時に実行
-    scheduler.add_job(check_and_notify_overdue_tickets, CronTrigger(hour=8, minute=0, timezone="Asia/Tokyo"))
-    if not scheduler.running:
-         scheduler.start()
-         print("Scheduler started.")
-    else:
-        print("Scheduler already running.")
-
-
-@app.on_event("shutdown")
-async def shutdown_event():
-    if scheduler.running:
-        scheduler.shutdown()
-        print("Scheduler stopped.")
 
 async def create_redmine_ticket_from_text(user_text: str, project_id: int = 1) -> str:
     try:
@@ -187,7 +198,7 @@ async def create_redmine_ticket_from_text(user_text: str, project_id: int = 1) -
                   f"}}\n"
                   f"```")
 
-        model = genai.GenerativeModel("gemini-1.5-flash")
+        model = genai.GenerativeModel("gemini-2.5-flash")  # モデル名を統一
         
         # IOバウンドな処理を非同期に実行
         response = await asyncio.to_thread(model.generate_content, prompt)
@@ -493,9 +504,8 @@ async def handle_conversation(user_id: str, user_text: str) -> str:
     conversation_history[user_id].append({"role": "user", "parts": [user_text]})
 
     # Geminiモデルを初期化
-    # Geminiモデルを初期化
     model = genai.GenerativeModel(
-        model_name="gemini-1.5-flash", # Tool Callingには高機能なモデルが適している
+        model_name="gemini-2.5-flash", # Tool Callingには高機能なモデルが適している
         tools=gemini_tools,
         generation_config=GenerationConfig(temperature=0.7)
     )
@@ -508,24 +518,28 @@ async def handle_conversation(user_id: str, user_text: str) -> str:
         response = await asyncio.to_thread(chat.send_message, user_text)
         
         # --- Geminiからの応答を解析 ---
-        response_part = response.parts[0]
-
-        # 1. ツールを使うように指示された場合
-        if response_part.function_call:
-            fc = response_part.function_call
+        final_reply = ""
+        
+        # responseのpartsを確認してfunction_callがあるかチェック
+        if response.parts and hasattr(response.parts[0], 'function_call') and response.parts[0].function_call:
+            # 1. ツールを使うように指示された場合
+            fc = response.parts[0].function_call
             tool_name = fc.name
             tool_args = {key: value for key, value in fc.args.items()}
+
+            print(f"Tool called: {tool_name} with args: {tool_args}")
 
             tool_result = "" # 初期化
             if tool_name == "create_redmine_ticket":
                 tool_result = create_redmine_ticket(**tool_args)
             elif tool_name == "search_redmine_issues":
                 tool_result = search_redmine_issues(**tool_args)
-            # ★★★ 新しいツールの処理を追加 ★★★
             elif tool_name == "get_ticket_summary":
                 tool_result = get_ticket_summary(**tool_args)
             else:
                 tool_result = json.dumps({"status": "error", "message": f"Unknown tool: {tool_name}"})
+
+            print(f"Tool result: {tool_result}")
 
             # ツール実行結果をGeminiにフィードバック
             feedback_response = await asyncio.to_thread(
@@ -539,9 +553,8 @@ async def handle_conversation(user_id: str, user_text: str) -> str:
             )
             # Geminiが生成した最終的な返答を取得
             final_reply = feedback_response.text
-        
-        # 2. 通常のテキスト応答の場合
         else:
+            # 2. 通常のテキスト応答の場合
             final_reply = response.text
 
         # 今回のAIの応答を履歴に追加
@@ -551,13 +564,17 @@ async def handle_conversation(user_id: str, user_text: str) -> str:
 
     except Exception as e:
         print(f"Error during conversation: {e}")
+        print(f"Error type: {type(e)}")
+        import traceback
+        traceback.print_exc()
+        
         # エラーが発生したら履歴をリセットするなどの処理も検討
         if user_id in conversation_history:
             del conversation_history[user_id]
         return "申し訳ありません、処理中にエラーが発生しました。もう一度お試しください。"
 
 # --- `handle_message` (LINEからのWebhook) の修正 ---
-@handler.add(MessageEvent, message=TextMessage)
+@handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
     user_id = event.source.user_id # ユーザーを識別するためにIDを取得
     user_message = event.message.text
@@ -569,11 +586,26 @@ def handle_message(event):
         try:
             # 新しい会話処理関数を呼び出す
             reply_message = await handle_conversation(user_id, user_message)
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_message))
+            
+            with ApiClient(configuration) as api_client:
+                line_bot_api = MessagingApi(api_client)
+                line_bot_api.reply_message(
+                    ReplyMessageRequest(
+                        reply_token=event.reply_token,
+                        messages=[V3TextMessage(text=reply_message)]
+                    )
+                )
         except Exception as e:
             print(f"Error in async task for LINE message: {e}")
             try:
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=f"処理中にエラーが発生しました: {e}"))
+                with ApiClient(configuration) as api_client:
+                    line_bot_api = MessagingApi(api_client)
+                    line_bot_api.reply_message(
+                        ReplyMessageRequest(
+                            reply_token=event.reply_token,
+                            messages=[V3TextMessage(text=f"処理中にエラーが発生しました: {e}")]
+                        )
+                    )
             except Exception as reply_e:
                 print(f"Failed to even send error reply: {reply_e}")
 
@@ -584,11 +616,11 @@ if __name__ == "__main__":
     print(f"🚀 Starting LINE Bot server on http://0.0.0.0:{WEBHOOK_PORT}")
     try:
         import httpx
-        from linebot import LineBotApi
-        from apscheduler.schedulers.asyncio import AsyncIOScheduler # 追加
+        from linebot.v3.messaging import MessagingApi
+        from apscheduler.schedulers.asyncio import AsyncIOScheduler
     except ImportError:
-        print("\n!!! httpx, line-bot-sdk or apscheduler is not installed. Please run: pip install httpx line-bot-sdk python-dotenv apscheduler !!!\n") # メッセージ修正
+        print("\n!!! httpx, linebot v3 or apscheduler is not installed. Please run: pip install httpx line-bot-sdk python-dotenv apscheduler !!!\n")
         sys.exit(1)
         
-    # uvicorn.runの第一引数を文字列ではなく、appオブジェクトに修正
-    uvicorn.run(app, host="0.0.0.0", port=int(WEBHOOK_PORT), log_level="info")
+    # reloadオプションを使用する場合は、アプリケーションを文字列で指定
+    uvicorn.run("webhook_app:app", host="0.0.0.0", port=int(WEBHOOK_PORT), log_level="info", reload=True)
