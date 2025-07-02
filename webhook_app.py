@@ -26,6 +26,7 @@ dotenv.load_dotenv()
 # 環境変数を定数として定義
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY")
 REDMINE_URL = os.environ.get("REDMINE_URL")
+REDMINE_PUBLIC_URL = os.environ.get("REDMINE_PUBLIC_URL", REDMINE_URL)  # 追加: 公開用URL
 REDMINE_API_KEY = os.environ.get("REDMINE_API_KEY")
 LINE_CHANNEL_ACCESS_TOKEN = os.environ.get("LINE_CHANNEL_ACCESS_TOKEN")
 LINE_CHANNEL_SECRET = os.environ.get("LINE_CHANNEL_SECRET")
@@ -134,7 +135,10 @@ async def check_and_notify_overdue_tickets():
 
     # タイムゾーンをJSTで取得し、今日の日付を文字列にする
     jst = timezone(timedelta(hours=9))
-    today_jst_str = datetime.now(jst).strftime('%Y-%m-%d')
+    today_jst = datetime.now(jst)
+    today_jst_str = today_jst.strftime('%Y-%m-%d')
+    
+    print(f"Current JST date: {today_jst_str}")  # デバッグ用ログ追加
 
     # .envから未完了ステータスのIDを取得
     open_status_ids = os.environ.get("REDMINE_OPEN_STATUS_IDS")
@@ -160,7 +164,7 @@ async def check_and_notify_overdue_tickets():
                 message += f"- ID: {issue['id']}, 件名: {issue['subject']}, 期限: {due_date}\n"
             messages_to_send.append(message)
         else:
-            print("No overdue or due today tickets found.")
+            print(f"No overdue or due today tickets found for date: {today_jst_str}")
 
     if messages_to_send:
         for msg_text in messages_to_send:
@@ -293,7 +297,7 @@ def create_redmine_ticket(subject: str, description: str, priority_name: str = "
             "message": "チケットは作成されましたが、IDの取得に失敗しました。"
         })
     
-    ticket_url = f"{REDMINE_URL}/issues/{ticket_id}"
+    ticket_url = f"{REDMINE_PUBLIC_URL}/issues/{ticket_id}"  # 公開用URLで返す
     
     return json.dumps({
         "status": "success",
@@ -376,6 +380,13 @@ def get_ticket_summary(limit: int = 10, priority_order: str = "high_to_low", sta
     """
     print(f"Executing: get_ticket_summary(limit={limit}, priority_order='{priority_order}', status_filter='{status_filter}')")
     
+    # 現在の日付を取得
+    jst = timezone(timedelta(hours=9))
+    today_jst = datetime.now(jst)
+    today_str = today_jst.strftime('%Y-%m-%d')
+    
+    print(f"Current date for analysis: {today_str}")  # デバッグ用
+    
     params = []
     
     # ステータスフィルタを適用
@@ -384,9 +395,8 @@ def get_ticket_summary(limit: int = 10, priority_order: str = "high_to_low", sta
         if open_status_ids:
             params.append(f"status_id={open_status_ids}")
     
-    # 優先度順でソート（priority.id を使用）
-    sort_order = "desc" if priority_order == "high_to_low" else "asc"
-    params.append(f"sort=priority:desc,created_on:desc")  # 優先度順、次に作成日順
+    # 優先度順でソート
+    params.append(f"sort=priority:desc,created_on:desc")
     
     # 取得件数の制限
     params.append(f"limit={limit}")
@@ -402,29 +412,50 @@ def get_ticket_summary(limit: int = 10, priority_order: str = "high_to_low", sta
     if not issues:
         return json.dumps({"status": "not_found", "message": "条件に一致するチケットは見つかりませんでした。"})
 
-    # チケット情報を要約して返す
-    summarized_issues = []
+    # チケット情報をGeminiが分析しやすい形式で返す
+    ticket_data = []
+    overdue_count = 0
+    due_today_count = 0
+    
     for issue in issues:
-        ticket_url = f"{REDMINE_URL}/issues/{issue['id']}"
         priority_name = issue.get("priority", {}).get("name", "未設定")
         status_name = issue.get("status", {}).get("name", "未設定")
-        due_date = issue.get("due_date", "未設定")
+        due_date = issue.get("due_date", "")
         
-        summarized_issues.append({
+        # 期日の状況を分析
+        date_status = "normal"
+        if due_date:
+            try:
+                due_date_obj = datetime.strptime(due_date, '%Y-%m-%d').date()
+                today_date = today_jst.date()
+                
+                if due_date_obj < today_date:
+                    date_status = "overdue"
+                    overdue_count += 1
+                elif due_date_obj == today_date:
+                    date_status = "due_today"
+                    due_today_count += 1
+            except ValueError:
+                pass  # 日付形式が不正な場合はスキップ
+        
+        ticket_data.append({
             "id": issue["id"],
             "subject": issue["subject"],
             "priority": priority_name,
             "status": status_name,
-            "due_date": due_date,
-            "url": ticket_url,
+            "due_date": due_date if due_date else "未設定",
+            "date_status": date_status,
             "created_on": issue.get("created_on", "")
         })
     
     return json.dumps({
         "status": "success", 
-        "total_count": len(summarized_issues),
-        "issues": summarized_issues,
-        "filter_info": f"優先度順: {priority_order}, ステータス: {status_filter}, 件数: {limit}"
+        "current_date": today_str,
+        "total_count": len(ticket_data),
+        "overdue_count": overdue_count,
+        "due_today_count": due_today_count,
+        "tickets": ticket_data,
+        "instruction": f"現在の日付は{today_str}です。これらのチケット情報を基に、秘書として状況を整理し、類似タスクをまとめ、期日の緊急度（期限切れ{overdue_count}件、本日期限{due_today_count}件）を考慮した実用的なアドバイスを含めて報告してください。期日が古い（2025年6月など）場合は期限切れとして扱ってください。"
     })
 
 # --- 会話処理のメインロジック ---
@@ -435,7 +466,7 @@ gemini_tools = [
         function_declarations=[
             genai.protos.FunctionDeclaration(
                 name="create_redmine_ticket",
-                description="ユーザーの依頼に基づいて新しいRedmineチケットを作成する。",
+                description="ユーザーの発言が命令形でなくても、ToDoや予定・依頼・思いつきなどタスク化できる内容ならRedmineチケットを作成する。",
                 parameters=genai.protos.Schema(
                     type=genai.protos.Type.OBJECT,
                     properties={
@@ -461,7 +492,7 @@ gemini_tools = [
             # ★★★ 新しいツール: チケット要約機能 ★★★
             genai.protos.FunctionDeclaration(
                 name="get_ticket_summary",
-                description="チケットの要約を優先度順で取得する。優先度の高いタスクから確認したい場合や、全体の状況を把握したい場合に使用。",
+                description="チケットの要約を優先度順で取得し、秘書として状況を分析・報告する。優先度の高いタスクから確認したい場合や、全体の状況を把握したい場合に使用。結果は類似タスクをまとめ、期日の緊急度を考慮して整理すること。",
                 parameters=genai.protos.Schema(
                     type=genai.protos.Type.OBJECT,
                     properties={
@@ -479,99 +510,172 @@ gemini_tools = [
 conversation_history = {}
 
 async def handle_conversation(user_id: str, user_text: str) -> str:
-    """ユーザーとの対話を管理し、適切な応答やツール実行を行う"""
+    """ユーザーとの対話を管理し、適切な応答やツール実行を行う（多段階エージェントループ対応＋function_call強制リトライ＋詳細ログ＋OK時一括チケット化）"""
+
+    # 現在の日付を取得
+    jst = timezone(timedelta(hours=9))
+    current_date = datetime.now(jst).strftime('%Y年%m月%d日')
     
     # システムプロンプトの定義
     system_instruction = (
-        "あなたは、ユーザーの意図を積極的に汲み取り、先回りして行動する非常に優秀なRedmineアシスタントです。"
-        "ユーザーの曖昧な依頼からでも、タスクの目的を推測し、チケット作成や検索を自律的に実行してください。"
-        "ユーザーから提供された情報は、それが断片的であっても、まずはチケットとして記録することを優先します。情報の不足を理由に、何度も質問を繰り返さないでください。"
-        "例えば、バスの予約情報が共有されたら、それを「移動の記録」や「リマインダー」として解釈し、適切な件名と説明で `create_redmine_ticket` を実行してください。目的をユーザーに聞き返す必要はありません。"
-        "「〇〇を忘れないように」という依頼も、そのままチケットの件名や説明にして記録してください。"
-        "「任せます」と言われたら、あなたの判断で最適なアクションを実行し、その結果を報告してください。"
-        "「今日のタスク」「〇〇の件はどうなってる？」のような問い合わせには、`search_redmine_issues` ツールを積極的に使用してください。キーワードだけでなく、日付（'today', 'this_week'など）や担当者（'me'）も指定できることを理解し、ユーザーの言葉から適切な引数を判断してください。"
-        "「優先度の高いタスク」「重要なチケット」「チケット一覧」「要約」などの問い合わせには、`get_ticket_summary` ツールを使用してください。優先度順でチケットを表示し、各チケットのURLも含めて報告してください。"
-        "**重要**: チケット作成が成功した場合は、必ずチケットのURLを含めてユーザーに報告してください。「チケットを作成しました！」だけでなく、「チケットID: XXX」「URL: https://...」のように具体的な情報を提供してください。"
-        "ツール実行後は、その結果（例：作成したチケットのURL、検索結果の要約）を、簡潔で分かりやすい言葉でユーザーに伝えてください。"
+        f"あなたは、ユーザーの優秀な秘書兼アシスタントです。今日は{current_date}です。"
+        "ユーザーが命令形でなくても、ToDo・やるべきこと・予定・希望・依頼・思いつきなど、"
+        "タスク化できそうな発言があれば必ずRedmineチケット化function_callを発動してください。"
+        "function_callを返さずにテキスト応答だけで済ませてはいけません。"
+        "チケットの要約を求められた場合は、単なるリストではなく、秘書として状況を分析し、"
+        "類似のタスクをまとめ、優先度を考慮した実用的なアドバイスを含めて報告してください。"
+        "期日が今日より前の日付（例：2025年6月の日付）の場合は、期限切れとして適切に報告してください。"
+        "例：'開発関連のタスクが3件、個人用務が2件、期日が今日のものが1件、期限切れが2件ございます。'"
+        "「今日のタスク」「重要なもの」「チケット一覧」などの問い合わせには、get_ticket_summaryツールを使用し、"
+        "その結果を基に、まるで有能な秘書が状況を整理して報告するような口調で回答してください。"
+        "チケット作成時は必ずURLを含めて報告し、検索結果も分かりやすく整理して提示してください。"
+        "ユーザーの意図を先読みし、効率的なタスク管理をサポートすることを心がけてください。"
+        "機械的なリスト表示は避け、常に人間らしい温かみのある対応を心がけてください。"
     )
 
     # ユーザーごとの会話履歴を取得（なければ初期化）
     if user_id not in conversation_history:
-        # 会話の最初にシステムプロンプトを設定
         conversation_history[user_id] = [{"role": "model", "parts": [system_instruction]}]
-
-    # 今回のユーザー発言を履歴に追加
     conversation_history[user_id].append({"role": "user", "parts": [user_text]})
 
-    # Geminiモデルを初期化
+    # --- OK時一括チケット化用の分割提案リスト記憶 ---
+    if "_last_split_proposal" not in conversation_history:
+        conversation_history["_last_split_proposal"] = {}
+
     model = genai.GenerativeModel(
-        model_name="gemini-2.5-flash", # Tool Callingには高機能なモデルが適している
+        model_name="gemini-2.5-flash",
         tools=gemini_tools,
         generation_config=GenerationConfig(temperature=0.7)
     )
-    
-    # 会話履歴を使ってチャットセッションを開始
     chat = model.start_chat(history=conversation_history[user_id])
 
-    try:
-        # ユーザーメッセージを送信
-        response = await asyncio.to_thread(chat.send_message, user_text)
-        
-        # --- Geminiからの応答を解析 ---
+    max_steps = 3
+    step = 0
+    final_reply = ""
+    last_tool_result = None
+    function_call_retry_done = False # リトライ済みフラグ
+    last_important_reply = None
+
+    while step < max_steps:
+        # ループの入力テキストを決定するロジックを簡素化
+        if step == 0:
+            # 最初のステップでは、ユーザーの入力をそのまま使う
+            input_text_for_ai = user_text
+        else:
+            # 2回目以降のステップでは、自己反省を促す
+            input_text_for_ai = (
+                "前回のチケット化・分割・最適化の結果を踏まえ、"
+                "他に分割すべきタスクや、追加でチケット化すべき内容、"
+                "または依存関係・順序最適化の必要があれば提案してください。"
+                "十分であれば「これで十分です」と返答してください。"
+            )
+            if last_tool_result:
+                input_text_for_ai += f"\n\n【前回のチケット化・分割・最適化結果】\n{last_tool_result}"
+
+        print(f"\n[AgentLoop] Step {step} - input_text to AI:\n{input_text_for_ai}\n")
+        response = await asyncio.to_thread(chat.send_message, input_text_for_ai)
+
+        # --- function_call強制リトライ（step 0の初回のみ） ---
+        is_function_call_in_response = any(hasattr(part, 'function_call') and part.function_call for part in response.parts)
+        if step == 0 and not function_call_retry_done and not is_function_call_in_response:
+            print("[AgentLoop] No function_call detected on first attempt. Forcing retry with explicit instruction.")
+            function_call_retry_done = True # リトライは一度しか行わない
+            retry_prompt = (
+                "上記の内容はRedmineチケット化すべきです。"
+                "必ずfunction_callでcreate_redmine_ticketを呼び出してください。"
+            )
+            response = await asyncio.to_thread(chat.send_message, retry_prompt)
+            print(f"[AgentLoop] Retry response received.")
+            # レスポンスが更新されたので、再度function_callの有無をチェック
+            is_function_call_in_response = any(hasattr(part, 'function_call') and part.function_call for part in response.parts)
+
+        # --- 分割提案リストを記憶 ---
+        if not is_function_call_in_response:
+            text_content = "".join([part.text for part in response.parts if hasattr(part, 'text')])
+            import re
+            split_tasks = re.findall(r"\*\*(.+?)\*\*", text_content)
+            if split_tasks:
+                conversation_history["_last_split_proposal"][user_id] = split_tasks
+                print(f"[AgentLoop] Detected split proposal: {split_tasks}")
+
+        # --- OK時一括チケット化 ---
+        if user_text.strip().lower() in ["ok", "ｏｋ", "はい", "はい。", "了解", "了解です", "お願いします", "お願い", "よろしいです", "よろしいです。", "それでいいよ", "それでok"]:
+            split_tasks = conversation_history["_last_split_proposal"].get(user_id)
+            if split_tasks:
+                created = []
+                for task in split_tasks:
+                    res = create_redmine_ticket(subject=task, description=task, priority_name="通常")
+                    try:
+                        res_json = json.loads(res)
+                        if res_json.get("status") == "success":
+                            created.append(f"・{res_json['subject']}\n  {res_json['ticket_url']}")
+                    except Exception as e:
+                        created.append(f"・{task}\n  (作成失敗) {e}")
+                if created:
+                    reply = "以下のタスクをRedmineチケットとして一括登録しました。\n\n" + "\n".join(created)
+                    print(f"[AgentLoop] Bulk ticket creation reply: {reply}")
+                    return reply
+                else:
+                    return "チケット作成に失敗しました。"
+
+        # --- 応答の処理 ---
         final_reply = ""
-        
-        # responseのpartsを確認してfunction_callがあるかチェック
-        if response.parts and hasattr(response.parts[0], 'function_call') and response.parts[0].function_call:
-            # 1. ツールを使うように指示された場合
-            fc = response.parts[0].function_call
-            tool_name = fc.name
-            tool_args = {key: value for key, value in fc.args.items()}
+        tool_called = False
+        for part in response.parts:
+            if hasattr(part, 'function_call') and part.function_call:
+                tool_called = True
+                fc = part.function_call
+                print(f"[AgentLoop] Gemini function_call: {fc.name} args={fc.args}")
+                tool_name = fc.name
+                tool_args = {key: value for key, value in fc.args.items()}
 
-            print(f"Tool called: {tool_name} with args: {tool_args}")
+                if tool_name == "create_redmine_ticket":
+                    tool_result = create_redmine_ticket(**tool_args)
+                elif tool_name == "search_redmine_issues":
+                    tool_result = search_redmine_issues(**tool_args)
+                elif tool_name == "get_ticket_summary":
+                    tool_result = get_ticket_summary(**tool_args)
+                else:
+                    tool_result = json.dumps({"status": "error", "message": f"Unknown tool: {tool_name}"})
 
-            tool_result = "" # 初期化
-            if tool_name == "create_redmine_ticket":
-                tool_result = create_redmine_ticket(**tool_args)
-            elif tool_name == "search_redmine_issues":
-                tool_result = search_redmine_issues(**tool_args)
-            elif tool_name == "get_ticket_summary":
-                tool_result = get_ticket_summary(**tool_args)
-            else:
-                tool_result = json.dumps({"status": "error", "message": f"Unknown tool: {tool_name}"})
+                print(f"[AgentLoop] Tool executed: {tool_name} args={tool_args}\nResult: {tool_result}")
+                last_tool_result = tool_result
 
-            print(f"Tool result: {tool_result}")
-
-            # ツール実行結果をGeminiにフィードバック
-            feedback_response = await asyncio.to_thread(
-                chat.send_message,
-                genai.protos.Part(
-                    function_response=genai.protos.FunctionResponse(
-                        name=tool_name,
-                        response={"result": tool_result}
+                feedback_response = await asyncio.to_thread(
+                    chat.send_message,
+                    genai.protos.Part(
+                        function_response=genai.protos.FunctionResponse(
+                            name=tool_name,
+                            response={"result": tool_result}
+                        )
                     )
                 )
-            )
-            # Geminiが生成した最終的な返答を取得
-            final_reply = feedback_response.text
-        else:
-            # 2. 通常のテキスト応答の場合
-            final_reply = response.text
 
-        # 今回のAIの応答を履歴に追加
-        conversation_history[user_id] = chat.history
-        
-        return final_reply
+                # ツール実行後の応答を処理
+                for feedback_part in feedback_response.parts:
+                    if hasattr(feedback_part, 'text') and feedback_part.text:
+                        final_reply += feedback_part.text
+                last_important_reply = final_reply
+                print(f"[AgentLoop] AI reply after tool: {final_reply}")
+                break # 1回のループでツールコールは1つと仮定
+            
+            elif hasattr(part, 'text') and part.text:
+                final_reply += part.text
 
-    except Exception as e:
-        print(f"Error during conversation: {e}")
-        print(f"Error type: {type(e)}")
-        import traceback
-        traceback.print_exc()
-        
-        # エラーが発生したら履歴をリセットするなどの処理も検討
-        if user_id in conversation_history:
-            del conversation_history[user_id]
-        return "申し訳ありません、処理中にエラーが発生しました。もう一度お試しください。"
+        if not tool_called:
+             print(f"[AgentLoop] AI text reply: {final_reply}")
+
+        if "これで十分" in final_reply or "十分です" in final_reply or "追加のチケットはありません" in final_reply:
+            print(f"[AgentLoop] AI judged as sufficient. Breaking loop at step {step}.")
+            break
+        step += 1
+
+    conversation_history[user_id] = chat.history
+    if final_reply.strip() in ["これで十分です。", "これで十分です", "十分です。", "十分です", "追加のチケットはありません。", "追加のチケットはありません"] and last_important_reply:
+        print("[AgentLoop] Returning last important reply instead of generic '十分' message.")
+        return last_important_reply
+    print(f"[AgentLoop] Final AI reply to user:\n{final_reply}\n")
+    return final_reply
 
 # --- `handle_message` (LINEからのWebhook) の修正 ---
 @handler.add(MessageEvent, message=TextMessageContent)
@@ -619,7 +723,7 @@ if __name__ == "__main__":
         from linebot.v3.messaging import MessagingApi
         from apscheduler.schedulers.asyncio import AsyncIOScheduler
     except ImportError:
-        print("\n!!! httpx, linebot v3 or apscheduler is not installed. Please run: pip install httpx line-bot-sdk python-dotenv apscheduler !!!\n")
+        print("\n!!! httpx, line-bot-sdk or apscheduler is not installed. Please run: pip install httpx line-bot-sdk python-dotenv apscheduler !!!\n")
         sys.exit(1)
         
     # reloadオプションを使用する場合は、アプリケーションを文字列で指定
